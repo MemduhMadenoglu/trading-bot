@@ -1,3 +1,5 @@
 .env
 __pycache__/
 *.pyc
+app.py.backup
+app.py.before_multi_position
