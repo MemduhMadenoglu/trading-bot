@@ -18,11 +18,23 @@ MAX_TRADE_TRY = 100
 MAX_TRADES_PER_DAY = 3
 MIN_BTC_POSITION = 0.00005
 
+AUTO_PAPER_TRADE = os.getenv("AUTO_PAPER_TRADE", "false").lower() == "true"
+PAPER_TRADE_AMOUNT_TRY = float(os.getenv("PAPER_TRADE_AMOUNT_TRY", 100))
+PAPER_START_BALANCE_TRY = float(os.getenv("PAPER_START_BALANCE_TRY", 10000))
+RSI_BUY_LEVEL = float(os.getenv("RSI_BUY_LEVEL", 30))
+RSI_SELL_LEVEL = float(os.getenv("RSI_SELL_LEVEL", 70))
+
 bot_active = True
 daily_trade_count = 0
 last_trade_day = time.strftime("%Y-%m-%d")
 last_update_id = None
 paper_position = None
+paper_balance_try = PAPER_START_BALANCE_TRY
+paper_realized_pnl = 0.0
+paper_total_trades = 0
+paper_winning_trades = 0
+paper_losing_trades = 0
+price_history = []
 
 def telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -72,6 +84,141 @@ def normalize_symbol(symbol):
     if symbol.endswith("TRY"):
         return symbol.replace("TRY", "_TRY")
     return symbol
+
+def get_current_price(symbol="BTC_TRY"):
+    raw_symbol = symbol.replace("_", "")
+
+    urls = [
+        f"https://api.binance.me/api/v3/ticker/price?symbol={raw_symbol}",
+        f"https://api.binance.me/api/v3/ticker/24hr?symbol={raw_symbol}",
+    ]
+
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=10)
+            data = r.json()
+
+            if isinstance(data, dict):
+                if "price" in data:
+                    return float(data["price"])
+                if "lastPrice" in data:
+                    return float(data["lastPrice"])
+
+        except Exception as e:
+            print("Price error:", e)
+
+    return None
+
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    k = 2 / (period + 1)
+    result = values[0]
+
+    for price in values[1:]:
+        result = price * k + result * (1 - k)
+
+    return result
+
+
+def rsi(values, period=14):
+    if len(values) <= period:
+        return None
+
+    recent = values[-(period + 1):]
+    gains = []
+    losses = []
+
+    for i in range(1, len(recent)):
+        diff = recent[i] - recent[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(abs(min(diff, 0)))
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def run_auto_paper_strategy(current_price):
+    global paper_position, paper_balance_try, daily_trade_count
+
+    if BOT_MODE == "live":
+        return
+
+    if not AUTO_PAPER_TRADE:
+        return
+
+    if len(price_history) < 30:
+        return
+
+    current_rsi = rsi(price_history, 14)
+    ema_fast = ema(price_history[-20:], 9)
+    ema_slow = ema(price_history[-30:], 21)
+
+    if current_rsi is None or ema_fast is None or ema_slow is None:
+        return
+
+    if paper_position is None:
+        if current_rsi <= RSI_BUY_LEVEL and ema_fast > ema_slow:
+            if paper_balance_try < PAPER_TRADE_AMOUNT_TRY:
+                telegram(f"⚠️ AUTO PAPER ALIŞ ENGELLENDİ\nYetersiz sanal bakiye: {round(paper_balance_try, 2)} TRY")
+                return
+
+            paper_position = calculate_levels(current_price)
+            paper_position["symbol"] = "BTC_TRY"
+            paper_position["amount_try"] = PAPER_TRADE_AMOUNT_TRY
+            paper_position["qty"] = PAPER_TRADE_AMOUNT_TRY / current_price
+            paper_position["strategy"] = "RSI_EMA_AUTO"
+
+            paper_balance_try -= PAPER_TRADE_AMOUNT_TRY
+            daily_trade_count += 1
+
+            telegram(
+                f"🟢 AUTO PAPER ALIŞ\n"
+                f"Sembol: BTC_TRY\n"
+                f"Giriş: {current_price}\n"
+                f"RSI: {round(current_rsi, 2)}\n"
+                f"EMA9: {round(ema_fast, 2)}\n"
+                f"EMA21: {round(ema_slow, 2)}\n"
+                f"Tutar: {PAPER_TRADE_AMOUNT_TRY} TRY"
+            )
+
+    else:
+        if current_rsi >= RSI_SELL_LEVEL:
+            closed = paper_position
+            qty = closed.get("qty", 0)
+            entry_value = closed.get("amount_try", 0)
+            exit_value = qty * current_price
+            pnl = exit_value - entry_value
+
+            paper_balance_try += exit_value
+            paper_realized_pnl += pnl
+            paper_total_trades += 1
+
+            if pnl > 0:
+                paper_winning_trades += 1
+            else:
+                paper_losing_trades += 1
+
+            paper_position = None
+
+            telegram(
+                f"🔴 AUTO PAPER SATIŞ\n"
+                f"Sebep: RSI_SELL\n"
+                f"Giriş: {closed.get('entry_price')}\n"
+                f"Çıkış: {current_price}\n"
+                f"PnL: {round(pnl, 2)} TRY\n"
+                f"Bakiye: {round(paper_balance_try, 2)} TRY\n"
+                f"Toplam PnL: {round(paper_realized_pnl, 2)} TRY\n"
+                f"RSI: {round(current_rsi, 2)}"
+            )
 
 def place_market_order(symbol, side, amount_try):
     symbol = normalize_symbol(symbol)
@@ -146,9 +293,60 @@ def telegram_polling():
 
         time.sleep(2)
 
+def position_monitor():
+    global paper_position, paper_balance_try, paper_realized_pnl, paper_total_trades, paper_winning_trades, paper_losing_trades, price_history
+
+    while True:
+        try:
+            current_price = get_current_price("BTC_TRY")
+
+            if current_price:
+                price_history.append(current_price)
+
+                if len(price_history) > 200:
+                    price_history.pop(0)
+
+                run_auto_paper_strategy(current_price)
+
+                if paper_position:
+                    paper_position = update_trailing(paper_position, current_price)
+                    close_now, reason = should_close(paper_position, current_price)
+
+                    if close_now:
+                        closed = paper_position
+                        qty = closed.get("qty", 0)
+                        entry_value = closed.get("amount_try", 0)
+                        exit_value = qty * current_price
+                        pnl = exit_value - entry_value
+
+                        paper_balance_try += exit_value
+                        paper_realized_pnl += pnl
+                        paper_position = None
+
+                        telegram(
+                            f"📉 PAPER POZİSYON KAPANDI\n"
+                            f"Sebep: {reason}\n"
+                            f"Sembol: {closed.get('symbol')}\n"
+                            f"Giriş: {closed.get('entry_price')}\n"
+                            f"Çıkış: {current_price}\n"
+                            f"PnL: {round(pnl, 2)} TRY\n"
+                            f"Bakiye: {round(paper_balance_try, 2)} TRY\n"
+                            f"Toplam PnL: {round(paper_realized_pnl, 2)} TRY\n"
+                            f"Stop: {closed.get('stop_loss')}\n"
+                            f"TP: {closed.get('take_profit')}\n"
+                            f"Trailing: {closed.get('trailing_stop')}"
+                        )
+
+        except Exception as e:
+            print("Position monitor error:", e)
+
+        time.sleep(15)
+
+
 @app.on_event("startup")
 def startup_event():
     threading.Thread(target=telegram_polling, daemon=True).start()
+    threading.Thread(target=position_monitor, daemon=True).start()
     telegram("✅ Bot başlatıldı. Bakiye kontrollü sürüm aktif.")
 
 @app.get("/")
@@ -164,12 +362,18 @@ def status():
         "try_balance": get_asset_free("TRY"),
         "daily_trade_count": daily_trade_count,
         "max_trades_per_day": MAX_TRADES_PER_DAY,
-        "paper_position": paper_position
+        "paper_position": paper_position,
+        "paper_balance_try": round(paper_balance_try, 2),
+        "paper_realized_pnl": round(paper_realized_pnl, 2),
+        "paper_total_trades": paper_total_trades,
+        "paper_winning_trades": paper_winning_trades,
+        "paper_losing_trades": paper_losing_trades,
+        "paper_win_rate": round((paper_winning_trades / paper_total_trades) * 100, 2) if paper_total_trades > 0 else 0
     }
 
 @app.post("/webhook")
 async def webhook(req: Request):
-    global daily_trade_count, last_trade_day, paper_position
+    global daily_trade_count, last_trade_day, paper_position, paper_balance_try, paper_realized_pnl, paper_total_trades, paper_winning_trades, paper_losing_trades
 
     if not bot_active:
         telegram("⛔ Bot kapalı, sinyal işlenmedi.")
@@ -214,15 +418,8 @@ async def webhook(req: Request):
         order = place_market_order(symbol, "BUY", amount_try)
         daily_trade_count += 1
 
-        if BOT_MODE != "live":
-            entry_price = float(data.get("price", 0))
-            if entry_price > 0:
-                paper_position = calculate_levels(entry_price)
-                paper_position["symbol"] = symbol
-                paper_position["amount_try"] = amount_try
-
-        telegram(f"✅ ALIŞ\n{symbol}\n{amount_try} TRY\n{BOT_MODE}\n{order}\nPozisyon: {paper_position}")
-        return {"ok": True, "order": order, "paper_position": paper_position}
+        telegram(f"✅ ALIŞ\n{symbol}\n{amount_try} TRY\n{BOT_MODE}\n{order}")
+        return {"ok": True, "order": order}
 
     if side == "SELL":
         if not has_btc():
@@ -232,9 +429,5 @@ async def webhook(req: Request):
         order = place_market_order(symbol, "SELL", amount_try)
         daily_trade_count += 1
 
-        closed_position = paper_position
-        if BOT_MODE != "live":
-            paper_position = None
-
-        telegram(f"🔴 SATIŞ\n{symbol}\nTüm BTC bakiyesi\n{BOT_MODE}\n{order}\nKapanan pozisyon: {closed_position}")
-        return {"ok": True, "order": order, "closed_position": closed_position}
+        telegram(f"🔴 SATIŞ\n{symbol}\nTüm BTC bakiyesi\n{BOT_MODE}\n{order}")
+        return {"ok": True, "order": order}
