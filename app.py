@@ -1,6 +1,7 @@
 import os, time, hmac, hashlib, requests, threading
 from urllib.parse import urlencode
 from fastapi import FastAPI, Request, HTTPException
+from risk.risk_manager import calculate_levels, update_trailing, should_close
 
 app = FastAPI()
 
@@ -21,6 +22,7 @@ bot_active = True
 daily_trade_count = 0
 last_trade_day = time.strftime("%Y-%m-%d")
 last_update_id = None
+paper_position = None
 
 def telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -161,12 +163,13 @@ def status():
         "btc_balance": get_asset_free("BTC"),
         "try_balance": get_asset_free("TRY"),
         "daily_trade_count": daily_trade_count,
-        "max_trades_per_day": MAX_TRADES_PER_DAY
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "paper_position": paper_position
     }
 
 @app.post("/webhook")
 async def webhook(req: Request):
-    global daily_trade_count, last_trade_day
+    global daily_trade_count, last_trade_day, paper_position
 
     if not bot_active:
         telegram("⛔ Bot kapalı, sinyal işlenmedi.")
@@ -211,8 +214,15 @@ async def webhook(req: Request):
         order = place_market_order(symbol, "BUY", amount_try)
         daily_trade_count += 1
 
-        telegram(f"✅ ALIŞ\n{symbol}\n{amount_try} TRY\n{BOT_MODE}\n{order}")
-        return {"ok": True, "order": order}
+        if BOT_MODE != "live":
+            entry_price = float(data.get("price", 0))
+            if entry_price > 0:
+                paper_position = calculate_levels(entry_price)
+                paper_position["symbol"] = symbol
+                paper_position["amount_try"] = amount_try
+
+        telegram(f"✅ ALIŞ\n{symbol}\n{amount_try} TRY\n{BOT_MODE}\n{order}\nPozisyon: {paper_position}")
+        return {"ok": True, "order": order, "paper_position": paper_position}
 
     if side == "SELL":
         if not has_btc():
@@ -222,5 +232,9 @@ async def webhook(req: Request):
         order = place_market_order(symbol, "SELL", amount_try)
         daily_trade_count += 1
 
-        telegram(f"🔴 SATIŞ\n{symbol}\nTüm BTC bakiyesi\n{BOT_MODE}\n{order}")
-        return {"ok": True, "order": order}
+        closed_position = paper_position
+        if BOT_MODE != "live":
+            paper_position = None
+
+        telegram(f"🔴 SATIŞ\n{symbol}\nTüm BTC bakiyesi\n{BOT_MODE}\n{order}\nKapanan pozisyon: {closed_position}")
+        return {"ok": True, "order": order, "closed_position": closed_position}
